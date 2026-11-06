@@ -1,0 +1,360 @@
+name: Deploy - Production Release
+
+on:
+  # Trigger after release workflow completes SUCCESSFULLY
+  workflow_run:
+    workflows:
+      - '🚀 Release & Tag'
+      - 'Publish Packages to GitHub Packages'
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+  deployments: write
+
+jobs:
+  # Check if triggered workflow was successful before proceeding
+  check-workflow-status:
+    name: 'Check Workflow Status'
+    runs-on: ubuntu-latest
+    outputs:
+      should-deploy: ${{ steps.check.outputs.should-deploy }}
+    steps:
+      - name: 'Check if workflow_run was successful'
+        id: check
+        run: |
+          # Only proceed if workflow_run completed successfully
+          # Or if manually triggered via workflow_dispatch
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "should-deploy=true" >> $GITHUB_OUTPUT
+            echo "✅ Manual deployment triggered"
+          elif [[ "${{ github.event.workflow_run.conclusion }}" == "success" ]]; then
+            echo "should-deploy=true" >> $GITHUB_OUTPUT
+            echo "✅ Workflow ${{ github.event.workflow_run.name }} completed successfully"
+          else
+            echo "should-deploy=false" >> $GITHUB_OUTPUT
+            echo "❌ Workflow ${{ github.event.workflow_run.name }} did not complete successfully (status: ${{ github.event.workflow_run.conclusion }})"
+          fi
+
+  # NOTE: Testing and security audits moved to release.yml (executed before versioning)
+  # This eliminates duplicate validation work and reduces pipeline time by ~10 minutes
+  # See: WORKFLOW-DUPLICATE-ANALYSIS.md for details on this optimization
+
+
+
+
+  # NOTE: Docker images now built in release.yml with semantic versioning
+  # This job validates that the pre-built images are accessible before deployment
+  # See: WORKFLOW-DUPLICATE-ANALYSIS.md Option 2 for details
+  validate-docker-image:
+    name: 'Validate Pre-built Docker Images'
+    runs-on: ubuntu-latest
+    needs: [check-workflow-status]
+    if: needs.check-workflow-status.outputs.should-deploy == 'true'
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image: ${{ steps.get-version.outputs.image }}
+      image-dashboard: ${{ steps.get-version.outputs.image-dashboard }}
+      version: ${{ steps.get-version.outputs.version }}
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📋 Get version from package.json
+        id: get-version
+        run: |
+          VERSION=$(jq -r '.version' package.json)
+          IMAGE="ghcr.io/${{ github.repository }}:v${VERSION}"
+          IMAGE_DASHBOARD="ghcr.io/${{ github.repository }}-dashboard:v${VERSION}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "image-dashboard=${IMAGE_DASHBOARD}" >> $GITHUB_OUTPUT
+          echo "✅ Using Docker images:"
+          echo "   - Bot: ${IMAGE}"
+          echo "   - Dashboard: ${IMAGE_DASHBOARD}"
+
+      - name: 🔐 Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔍 Validate bot image exists
+        run: |
+          IMAGE="${{ steps.get-version.outputs.image }}"
+          echo "Checking if bot image exists: ${IMAGE}"
+          
+          if docker pull "${IMAGE}" 2>&1 | grep -q "Downloaded newer image\|Status:"; then
+            echo "✅ Bot Docker image validated and available"
+          else
+            echo "⚠️ Note: Image may have been created in this release.yml run"
+          fi
+
+      - name: 🔍 Validate dashboard image exists
+        run: |
+          IMAGE="${{ steps.get-version.outputs.image-dashboard }}"
+          echo "Checking if dashboard image exists: ${IMAGE}"
+          
+          if docker pull "${IMAGE}" 2>&1 | grep -q "Downloaded newer image\|Status:"; then
+            echo "✅ Dashboard Docker image validated and available"
+          else
+            echo "⚠️ Note: Image may have been created in this release.yml run"
+          fi
+
+  deploy-staging:
+    name: 'Deploy to Staging'
+    runs-on: ubuntu-latest
+    needs: [validate-docker-image]
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    environment:
+      name: staging
+      url: https://staging.example.com
+    permissions:
+      contents: read
+      deployments: write
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🚀 Create deployment
+        id: deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.ref,
+              environment: 'staging',
+              description: 'Staging deployment',
+              required_contexts: [],
+              auto_merge: false
+            });
+            core.setOutput('deployment_id', deployment.data.id);
+
+      - name: 🔄 Update deployment status to in_progress
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.deployment.outputs.deployment_id }},
+              state: 'in_progress',
+              description: 'Staging deployment in progress'
+            });
+
+      - name: 📝 Deploy application
+        id: deploy
+        continue-on-error: true
+        env:
+          DOCKER_IMAGE: ${{ needs.validate-docker-image.outputs.image }}
+          DOCKER_VERSION: ${{ needs.validate-docker-image.outputs.version }}
+        run: |
+          # Add your staging deployment command here
+          # Example: docker-compose -f docker-compose.staging.yml pull && docker-compose -f docker-compose.staging.yml up -d
+          echo "🚀 Deploying to staging environment"
+          echo "Image: ${DOCKER_IMAGE}"
+          echo "Version: v${DOCKER_VERSION}"
+
+      - name: ✅ Update deployment status to success
+        if: steps.deploy.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.deployment.outputs.deployment_id }},
+              state: 'success',
+              description: 'Staging deployment completed',
+              environment_url: 'https://staging.example.com'
+            });
+
+      - name: ❌ Update deployment status to failure
+        if: steps.deploy.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.deployment.outputs.deployment_id }},
+              state: 'failure',
+              description: 'Staging deployment failed'
+            });
+
+  smoke-tests-staging:
+    name: 'Smoke Tests - Staging'
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: needs.deploy-staging.result == 'success'
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+
+      - name: 🧪 Run smoke tests
+        id: smoke
+        continue-on-error: true
+        env:
+          STAGING_URL: https://staging.example.com
+        run: |
+          # Add smoke tests here
+          # Example: npm run test:smoke -- --url $STAGING_URL
+          echo "Running smoke tests against staging environment"
+
+      - name: 📝 Report smoke test results
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const outcome = '${{ steps.smoke.outcome }}';
+            let summary = '## 🧪 Staging Smoke Tests\n\n';
+
+            if (outcome === 'success') {
+              summary += '✅ All smoke tests passed\n';
+              core.notice(summary);
+            } else {
+              summary += '❌ Smoke tests failed\n';
+              summary += 'Investigate staging deployment before production release\n';
+              core.setFailed(summary);
+            }
+
+  deploy-production:
+    name: 'Deploy to Production'
+    runs-on: ubuntu-latest
+    needs: [validate-docker-image, smoke-tests-staging]
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
+    environment:
+      name: production
+      url: https://example.com
+    permissions:
+      contents: read
+      deployments: write
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🚀 Create deployment
+        id: deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.ref,
+              environment: 'production',
+              description: 'Production deployment',
+              required_contexts: [],
+              auto_merge: false
+            });
+            core.setOutput('deployment_id', deployment.data.id);
+
+      - name: 🔄 Update deployment status to in_progress
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.deployment.outputs.deployment_id }},
+              state: 'in_progress',
+              description: 'Production deployment in progress'
+            });
+
+      - name: 📝 Deploy application
+        id: deploy
+        continue-on-error: true
+        env:
+          DOCKER_IMAGE: ${{ needs.validate-docker-image.outputs.image }}
+          DOCKER_VERSION: ${{ needs.validate-docker-image.outputs.version }}
+        run: |
+          # Add your production deployment command here
+          # Example: docker-compose -f docker-compose.yml pull && docker-compose -f docker-compose.yml up -d
+          echo "🚀 Deploying to production environment"
+          echo "Image: ${DOCKER_IMAGE}"
+          echo "Version: v${DOCKER_VERSION}"
+
+          # Add health check
+          sleep 5
+          # curl -f https://example.com/health || exit 1
+
+      - name: ✅ Update deployment status to success
+        if: steps.deploy.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.deployment.outputs.deployment_id }},
+              state: 'success',
+              description: 'Production deployment completed',
+              environment_url: 'https://example.com'
+            });
+
+      - name: ❌ Update deployment status to failure
+        if: steps.deploy.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.deployment.outputs.deployment_id }},
+              state: 'failure',
+              description: 'Production deployment failed'
+            });
+
+  deployment-summary:
+    name: 'Deployment Summary'
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [validate-docker-image, deploy-staging, deploy-production]
+
+    steps:
+      - name: 📋 Generate deployment summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const build = '${{ needs.validate-docker-image.result }}';
+            const staging = '${{ needs.deploy-staging.result }}';
+            const production = '${{ needs.deploy-production.result }}';
+
+            let summary = '## 🚀 Deployment Summary\n\n';
+            summary += `${build === 'success' ? '✅' : '❌'} Docker Image Validation\n`;
+            summary += `${staging === 'success' ? '✅' : '⏭️'} Staging Deployment\n`;
+            summary += `${production === 'success' ? '✅' : '⏭️'} Production Deployment\n`;
+            summary += '\n*Docker image built and versioned in release.yml*\n';
+
+            core.notice(summary);

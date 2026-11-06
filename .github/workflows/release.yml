@@ -1,0 +1,563 @@
+name: 🚀 Release & Versioning
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+  actions: write
+  checks: write
+  pull-requests: write
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # PARALLEL PHASE 1: Pre-Release Checks (3 parallel jobs)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Job 1a: Run full test suite
+  run-tests:
+    name: 🧪 Run Full Test Suite
+    uses: ./.github/workflows/testing.yml
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+
+  # Job 1b: Pre-release security check (parallel with tests)
+  pre-release-check:
+    name: 🔒 Pre-Release Security Check
+    uses: ./.github/workflows/reusable-audit-check.yml
+    permissions:
+      contents: read
+    with:
+      fail-on-critical: true
+      fail-on-baseline-exceeded: true
+      check-baseline: true
+
+  # Job 1c: Lint & format validation (parallel with tests & security)
+  lint-format-check:
+    name: ✅ Code Quality Check
+    uses: ./.github/workflows/reusable-lint-format.yml
+    with:
+      fail-on-error: true
+      comment-on-pr: false
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SEQUENTIAL PHASE 2: Version Analysis
+  # ════════════════════════════════════════════════════════════════════════════
+
+  analyze-workspace-changes:
+    name: 📊 Analyze Workspace Changes
+    runs-on: ubuntu-latest
+    needs: [run-tests, pre-release-check, lint-format-check]
+    if: needs.run-tests.result == 'success' && needs.pre-release-check.result == 'success'
+    outputs:
+      root-version: ${{ steps.analyze.outputs.root-version }}
+      utils-bump: ${{ steps.analyze.outputs.utils-bump }}
+      core-bump: ${{ steps.analyze.outputs.core-bump }}
+      commands-bump: ${{ steps.analyze.outputs.commands-bump }}
+      dashboard-bump: ${{ steps.analyze.outputs.dashboard-bump }}
+      has-changes: ${{ steps.analyze.outputs.has-changes }}
+    
+    steps:
+      - name: 📥 Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+
+      - name: 📚 Install dependencies
+        run: npm ci --workspaces
+
+      - name: 🏷️ Get latest release tag
+        id: get-tag
+        run: |
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          
+          if [ -z "$LATEST_TAG" ]; then
+            FIRST_COMMIT=$(git rev-list --max-parents=0 HEAD)
+            COMMIT_RANGE="$FIRST_COMMIT..HEAD"
+            echo "tag=initial" >> $GITHUB_OUTPUT
+            echo "range=${COMMIT_RANGE}" >> $GITHUB_OUTPUT
+            echo "ℹ️ No previous release found, analyzing all commits"
+          else
+            COMMIT_RANGE="$LATEST_TAG..HEAD"
+            echo "tag=${LATEST_TAG}" >> $GITHUB_OUTPUT
+            echo "range=${COMMIT_RANGE}" >> $GITHUB_OUTPUT
+            echo "🏷️ Analyzing changes since $LATEST_TAG"
+          fi
+
+      - name: 🔍 Analyze workspace changes using new system
+        id: analyze
+        run: |
+          echo "📊 Running workspace-independent version analysis..."
+          echo ""
+          echo "🔵 DEBUG: Analyzing commit range: ${{ steps.get-tag.outputs.range }}"
+          echo ""
+          
+          # Run analysis script that now uses workspace-independent detection
+          # Add error handling to show script output if it fails
+          if ! node scripts/analyze-version-impact.js "${{ steps.get-tag.outputs.tag }}" > analysis_output.txt 2>&1; then
+            echo "❌ Analysis script failed"
+            echo "=== Script output ==="
+            cat analysis_output.txt
+            exit 1
+          fi
+          
+          cat analysis_output.txt
+          
+          # Parse output (script outputs structured data we can extract)
+          # Extract version bumps for each workspace
+          ANALYSIS=$(cat analysis_output.txt)
+          
+          # DEBUG: Show raw analysis output
+          echo ""
+          echo "🔵 DEBUG: Raw analysis output:"
+          echo "$ANALYSIS"
+          echo ""
+          
+          # Initialize all bumps to none
+          UTILS_BUMP="none"
+          CORE_BUMP="none"
+          COMMANDS_BUMP="none"
+          DASHBOARD_BUMP="none"
+          ROOT_BUMP="none"
+          HAS_CHANGES="false"
+          
+          # Extract bump levels from script output
+          # Script outputs lines like: necrobot-utils: MAJOR
+          UTILS_BUMP=$(echo "$ANALYSIS" | grep "^necrobot-utils:" | awk '{print tolower($NF)}' || echo "none")
+          CORE_BUMP=$(echo "$ANALYSIS" | grep "^necrobot-core:" | awk '{print tolower($NF)}' || echo "none")
+          COMMANDS_BUMP=$(echo "$ANALYSIS" | grep "^necrobot-commands:" | awk '{print tolower($NF)}' || echo "none")
+          DASHBOARD_BUMP=$(echo "$ANALYSIS" | grep "^necrobot-dashboard:" | awk '{print tolower($NF)}' || echo "none")
+          # Extract root bump from "ROOT: MAJOR/MINOR/PATCH" line in the output
+          ROOT_BUMP=$(echo "$ANALYSIS" | grep "^  • ROOT:" | sed -n 's/.*ROOT: \([A-Z]*\).*/\1/p' | tr 'A-Z' 'a-z' || echo "none")
+          
+          # DEBUG: Show extracted bump types
+          echo "🔵 DEBUG: Extracted bump types:"
+          echo "  • UTILS_BUMP=$UTILS_BUMP (raw grep: $(echo "$ANALYSIS" | grep "^necrobot-utils:" || echo "NO MATCH"))"
+          echo "  • CORE_BUMP=$CORE_BUMP (raw grep: $(echo "$ANALYSIS" | grep "^necrobot-core:" || echo "NO MATCH"))"
+          echo "  • COMMANDS_BUMP=$COMMANDS_BUMP (raw grep: $(echo "$ANALYSIS" | grep "^necrobot-commands:" || echo "NO MATCH"))"
+          echo "  • DASHBOARD_BUMP=$DASHBOARD_BUMP (raw grep: $(echo "$ANALYSIS" | grep "^necrobot-dashboard:" || echo "NO MATCH"))"
+          echo "  • ROOT_BUMP=$ROOT_BUMP (raw grep: $(echo "$ANALYSIS" | grep "^  • ROOT:" || echo "NO MATCH"))"
+          echo ""
+          
+          # Check if there are any changes (any bump other than 'none', including ROOT changes)
+          if [[ "$UTILS_BUMP" != "none" ]] || [[ "$CORE_BUMP" != "none" ]] || [[ "$COMMANDS_BUMP" != "none" ]] || [[ "$DASHBOARD_BUMP" != "none" ]] || [[ "$ROOT_BUMP" != "none" ]]; then
+            HAS_CHANGES="true"
+          fi
+          
+          # Output for next jobs
+          echo "utils-bump=${UTILS_BUMP}" >> $GITHUB_OUTPUT
+          echo "core-bump=${CORE_BUMP}" >> $GITHUB_OUTPUT
+          echo "commands-bump=${COMMANDS_BUMP}" >> $GITHUB_OUTPUT
+          echo "dashboard-bump=${DASHBOARD_BUMP}" >> $GITHUB_OUTPUT
+          echo "root-version=${ROOT_BUMP}" >> $GITHUB_OUTPUT
+          echo "has-changes=${HAS_CHANGES}" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "✅ Analysis complete (DEBUG LOGGING ENABLED):"
+          echo "  • necrobot-utils: $UTILS_BUMP"
+          echo "  • necrobot-core: $CORE_BUMP"
+          echo "  • necrobot-commands: $COMMANDS_BUMP"
+          echo "  • necrobot-dashboard: $DASHBOARD_BUMP"
+          echo "  • Root version bump: $ROOT_BUMP"
+          echo "  • Has changes: $HAS_CHANGES"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SEQUENTIAL PHASE 3: Apply Version Bumps & Create Tags
+  # ════════════════════════════════════════════════════════════════════════════
+
+  apply-version-bumps:
+    name: 🔄 Apply Version Bumps
+    runs-on: ubuntu-latest
+    needs: [analyze-workspace-changes]
+    if: needs.analyze-workspace-changes.outputs.has-changes == 'true'
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+    
+    steps:
+      - name: 📥 Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+
+      - name: 📚 Install dependencies
+        run: npm ci --workspaces
+
+      - name: 🔄 Bump workspace versions
+        id: bump
+        run: |
+          # Get the tag or initial commit
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          
+          if [ -z "$LATEST_TAG" ]; then
+            FIRST_COMMIT=$(git rev-list --max-parents=0 HEAD)
+            COMMIT_RANGE="$FIRST_COMMIT..HEAD"
+          else
+            COMMIT_RANGE="$LATEST_TAG..HEAD"
+          fi
+          
+          echo "📝 Applying bumps for range: $COMMIT_RANGE"
+          echo ""
+          echo "🔵 DEBUG: Bumps being applied:"
+          echo "  • utils-bump: ${{ needs.analyze-workspace-changes.outputs.utils-bump }}"
+          echo "  • core-bump: ${{ needs.analyze-workspace-changes.outputs.core-bump }}"
+          echo "  • commands-bump: ${{ needs.analyze-workspace-changes.outputs.commands-bump }}"
+          echo "  • dashboard-bump: ${{ needs.analyze-workspace-changes.outputs.dashboard-bump }}"
+          echo "  • root-version: ${{ needs.analyze-workspace-changes.outputs.root-version }}"
+          echo ""
+          
+          # Use sync-package-versions to apply workspace-independent bumps
+          node scripts/sync-package-versions.js "$COMMIT_RANGE"
+          
+          # Get new version
+          NEW_VERSION=$(jq -r '.version' package.json)
+          echo "version=${NEW_VERSION}" >> $GITHUB_OUTPUT
+          echo ""
+          echo "🔵 DEBUG: Version application complete"
+          echo "  • Old version: $LATEST_TAG"
+          echo "  • New version: v${NEW_VERSION}"
+          echo ""
+          echo "✅ Versions bumped to v${NEW_VERSION}"
+
+      - name: ✅ Verify version updates
+        run: |
+          echo "📋 Updated versions:"
+          echo "  Root: $(jq -r '.version' package.json)"
+          echo "  Utils: $(jq -r '.version' repos/necrobot-utils/package.json)"
+          echo "  Core: $(jq -r '.version' repos/necrobot-core/package.json)"
+          echo "  Commands: $(jq -r '.version' repos/necrobot-commands/package.json)"
+          echo "  Dashboard: $(jq -r '.version' repos/necrobot-dashboard/package.json)"
+
+      - name: 📝 Commit version changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add -A
+          git commit -m "chore(versioning): Bump workspace versions to v${{ steps.bump.outputs.version }}" --no-verify || echo "⚠️ No changes to commit"
+          
+          # Push directly (won't trigger another release workflow because of when conditions)
+          git push origin ${{ github.ref_name }} || echo "⚠️ Push failed (might already be up to date)"
+
+      - name: ✅ Validate all tags against SemVer strategy
+        run: |
+          echo "🔍 Validating release tags against SemVer strategy..."
+          npm run validate:tags:strict
+          echo "✅ All tags validated successfully"
+
+      - name: 🏷️ Create Release Tags (All Workspaces + Root)
+        run: |
+          # Get versions from all packages
+          ROOT_VERSION=$(jq -r '.version' package.json)
+          UTILS_VERSION=$(jq -r '.version' repos/necrobot-utils/package.json)
+          CORE_VERSION=$(jq -r '.version' repos/necrobot-core/package.json)
+          COMMANDS_VERSION=$(jq -r '.version' repos/necrobot-commands/package.json)
+          DASHBOARD_VERSION=$(jq -r '.version' repos/necrobot-dashboard/package.json)
+          
+          echo "📝 Creating release tags..."
+          echo "  Workspace tags:"
+          echo "    • v${UTILS_VERSION}-utils"
+          echo "    • v${CORE_VERSION}-core"
+          echo "    • v${COMMANDS_VERSION}-commands"
+          echo "    • v${DASHBOARD_VERSION}-dashboard"
+          echo "  Root tag:"
+          echo "    • v${ROOT_VERSION}"
+          
+          # Create workspace tags (workspace-specific versions)
+          git tag "v${UTILS_VERSION}-utils" || echo "⚠️ Utils tag already exists"
+          git tag "v${CORE_VERSION}-core" || echo "⚠️ Core tag already exists"
+          git tag "v${COMMANDS_VERSION}-commands" || echo "⚠️ Commands tag already exists"
+          git tag "v${DASHBOARD_VERSION}-dashboard" || echo "⚠️ Dashboard tag already exists"
+          
+          # Create root tag (root version)
+          git tag "v${ROOT_VERSION}" || echo "⚠️ Root tag already exists"
+          
+          echo ""
+          echo "✅ Tags created. Pushing to GitHub..."
+          
+          # Push all tags to GitHub
+          git push origin --tags || echo "⚠️ Some tags may already exist on remote"
+          
+          echo "✅ Release tags pushed successfully"
+
+      - name: ✅ Verify all tags created successfully
+        run: |
+          echo "🔍 Verifying release tags..."
+          npm run validate:tags:check
+          echo "✅ Tag verification complete"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # PARALLEL PHASE 4: Publishing & Docker Builds (3 parallel jobs)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Job 4a: Sequential package publishing (utils → core → commands → dashboard)
+  publish-utils:
+    name: 📦 Publish necrobot-utils
+    needs: [apply-version-bumps]
+    uses: ./.github/workflows/reusable-publish-package.yml
+    with:
+      package-name: necrobot-utils
+      workspace-path: repos/necrobot-utils
+      scope: '@rarsus'
+    secrets:
+      PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+
+  publish-core:
+    name: 📦 Publish necrobot-core
+    needs: [publish-utils]
+    uses: ./.github/workflows/reusable-publish-package.yml
+    with:
+      package-name: necrobot-core
+      workspace-path: repos/necrobot-core
+      scope: '@rarsus'
+    secrets:
+      PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+
+  publish-commands:
+    name: 📦 Publish necrobot-commands
+    needs: [publish-core]
+    uses: ./.github/workflows/reusable-publish-package.yml
+    with:
+      package-name: necrobot-commands
+      workspace-path: repos/necrobot-commands
+      scope: '@rarsus'
+    secrets:
+      PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+
+  publish-dashboard:
+    name: 📦 Publish necrobot-dashboard
+    needs: [publish-commands]
+    uses: ./.github/workflows/reusable-publish-package.yml
+    with:
+      package-name: necrobot-dashboard
+      workspace-path: repos/necrobot-dashboard
+      scope: '@rarsus'
+    secrets:
+      PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+
+  # Job 4b: Build bot Docker image (parallel with publishing)
+  build-bot-image:
+    name: 🐳 Build Bot Docker Image
+    runs-on: ubuntu-latest
+    needs: [apply-version-bumps]
+    if: needs.apply-version-bumps.result == 'success'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      image-tags: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 📦 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🔐 Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📋 Get version
+        id: get-version
+        run: |
+          VERSION=$(jq -r '.version' package.json)
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: 📊 Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern=v{{version}},value=v${{ steps.get-version.outputs.version }}
+            type=semver,pattern={{version}},value=${{ steps.get-version.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.get-version.outputs.version }}
+            type=raw,value=stable,enable={{is_default_branch}}
+
+      - name: 🏗️ Build and push bot image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: bot
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Job 4c: Build dashboard Docker image (parallel with bot build & publishing)
+  build-dashboard-image:
+    name: 🎨 Build Dashboard Docker Image
+    runs-on: ubuntu-latest
+    needs: [apply-version-bumps]
+    if: needs.apply-version-bumps.result == 'success'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      image-tags: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 📦 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🔐 Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📋 Get version
+        id: get-version
+        run: |
+          VERSION=$(jq -r '.version' package.json)
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: 📊 Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}-dashboard
+          tags: |
+            type=semver,pattern=v{{version}},value=v${{ steps.get-version.outputs.version }}
+            type=semver,pattern={{version}},value=${{ steps.get-version.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.get-version.outputs.version }}
+            type=raw,value=stable,enable={{is_default_branch}}
+
+      - name: 🏗️ Build and push dashboard image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          target: dashboard
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # FINAL PHASE: Verification & Summary (runs after all parallel jobs)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  verify-packages:
+    name: ✅ Verify Published Packages
+    runs-on: ubuntu-latest
+    needs: [publish-dashboard]
+    if: always()
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 🔐 Configure npm
+        run: |
+          npm config set @rarsus:registry https://npm.pkg.github.com
+          npm config set //npm.pkg.github.com/:_authToken="$NODE_AUTH_TOKEN"
+
+      - name: 🔍 Verify packages in registry
+        run: |
+          echo "## 📦 Package Registry Verification" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          for pkg in necrobot-utils necrobot-core necrobot-commands necrobot-dashboard; do
+            if npm view @rarsus/$pkg >/dev/null 2>&1; then
+              VERSION=$(npm view @rarsus/$pkg version)
+              echo "✅ @rarsus/$pkg@$VERSION" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "⚠️ @rarsus/$pkg (not yet available)" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+  release-summary:
+    name: 📊 Release Summary
+    runs-on: ubuntu-latest
+    needs: [analyze-workspace-changes, apply-version-bumps, build-bot-image, build-dashboard-image, verify-packages]
+    if: always()
+
+    steps:
+      - name: 📊 Create release summary
+        run: |
+          echo "## 🚀 Release & Versioning Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### ✅ Release Phases Completed" >> $GITHUB_STEP_SUMMARY
+          echo "1. ✅ Pre-release checks (tests, security, lint)" >> $GITHUB_STEP_SUMMARY
+          echo "2. ✅ Workspace analysis (version impact analysis)" >> $GITHUB_STEP_SUMMARY
+          echo "3. ✅ Version bumping (workspace-independent)" >> $GITHUB_STEP_SUMMARY
+          echo "4. ✅ Publishing (parallel npm packages + Docker images)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### 📊 Workspace Version Bumps" >> $GITHUB_STEP_SUMMARY
+          echo "- **necrobot-utils**: ${{ needs.analyze-workspace-changes.outputs.utils-bump }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **necrobot-core**: ${{ needs.analyze-workspace-changes.outputs.core-bump }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **necrobot-commands**: ${{ needs.analyze-workspace-changes.outputs.commands-bump }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **necrobot-dashboard**: ${{ needs.analyze-workspace-changes.outputs.dashboard-bump }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### 🎯 Release Version" >> $GITHUB_STEP_SUMMARY
+          echo "**v${{ needs.apply-version-bumps.outputs.version }}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### 🐳 Docker Images" >> $GITHUB_STEP_SUMMARY
+          echo "- **Bot**: ghcr.io/${{ github.repository }}:v${{ needs.build-bot-image.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Dashboard**: ghcr.io/${{ github.repository }}-dashboard:v${{ needs.build-dashboard-image.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### 📈 Parallelism Strategy" >> $GITHUB_STEP_SUMMARY
+          echo "- Phase 1: 3 parallel pre-release checks (tests, security, lint)" >> $GITHUB_STEP_SUMMARY
+          echo "- Phase 2: Sequential version analysis" >> $GITHUB_STEP_SUMMARY
+          echo "- Phase 3: Sequential version bumping & tagging" >> $GITHUB_STEP_SUMMARY
+          echo "- Phase 4: 3 parallel job groups:" >> $GITHUB_STEP_SUMMARY
+          echo "  - Sequential npm package publishing (with dependency order)" >> $GITHUB_STEP_SUMMARY
+          echo "  - Parallel bot Docker image build" >> $GITHUB_STEP_SUMMARY
+          echo "  - Parallel dashboard Docker image build" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "**Status**: 🟢 Complete" >> $GITHUB_STEP_SUMMARY

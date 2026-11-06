@@ -1,0 +1,82 @@
+name: Testing - Unit & Integration
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+  # Allow this workflow to be called as reusable from other workflows
+  workflow_call:
+    outputs:
+      test-result:
+        description: 'Overall test result (success/failure)'
+        value: ${{ jobs.test-summary.outputs.result }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  unit-tests:
+    name: 'Unit Tests (Node 22.x)'
+    uses: ./.github/workflows/reusable-tests.yml
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    with:
+      test-type: 'unit'
+      coverage-enabled: true
+
+  integration-tests:
+    name: 'Integration Tests'
+    uses: ./.github/workflows/reusable-tests.yml
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    needs: [unit-tests]
+    if: always() && needs.unit-tests.result != 'failure'
+    with:
+      test-type: 'integration'
+      coverage-enabled: true
+
+  test-summary:
+    name: 'Test Summary'
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests]
+    if: always()
+
+    steps:
+      - name: 📋 Create test summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const unitResult = '${{ needs.unit-tests.result }}';
+            const integrationResult = '${{ needs.integration-tests.result }}';
+
+            const allPassed = [unitResult, integrationResult]
+              .every(r => r === 'success' || r === 'skipped');
+
+            let summary = '## 🧪 Test Execution Summary\n\n';
+            summary += `${unitResult === 'success' ? '✅' : '❌'} Unit Tests (Node 22)\n`;
+            summary += `${integrationResult === 'success' ? '✅' : '❌'} Integration Tests\n`;
+
+            if (allPassed) {
+              core.notice('✅ All tests passed!');
+            } else {
+              core.setFailed('Some tests failed');
+            }
+
+      - name: ❌ Fail workflow if tests failed
+        if: |
+          needs.unit-tests.result == 'failure' ||
+          needs.integration-tests.result == 'failure'
+        run: exit 1
+

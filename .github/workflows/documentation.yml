@@ -1,0 +1,33 @@
+name: Documentation - Links, Format, Breaking Changes
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'docs/QRC/**'
+      - 'project-docs/**'
+      - '**/*.md'
+      - '.github/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  documentation-validation:
+    name: 'Document Validation (Links, Format, Naming)'
+    uses: ./.github/workflows/reusable-document-validation.yml
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      validate-markdown: true
+      validate-links: true
+      validate-naming: true
+
